@@ -1,0 +1,102 @@
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, IntegerType
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml import Pipeline
+from pyspark.ml.regression import DecisionTreeRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.regression import GBTRegressor
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+spark=SparkSession.builder.appName("TaxiApp").config("spark.sql.execution.arrow.pyspark.enabled", "true").getOrCreate()
+plt.style.use('ggplot')
+spark
+data = spark.read.csv('yellow_tripdata_2015*.csv')
+
+data.createOrReplaceTempView('NY_taxi')
+data.count()
+data.printSchema()
+
+data = data.drop('_c4','_c7','_c8','_c11','_c12','c13','_c14','_c15','_c16','_c17')
+
+
+data.printSchema()
+data = data.withColumn("_c18", data["_c18"].cast(DoubleType()))
+data = data.withColumn("_c5", data["_c5"].cast(DoubleType()))
+data = data.withColumn("_c6", data["_c6"].cast(DoubleType()))
+data = data.withColumn("_c9", data["_c9"].cast(DoubleType()))
+data = data.withColumn("_c10", data["_c10"].cast(DoubleType()))
+data = data.withColumn("_c3", data["_c3"].cast(IntegerType()))
+data.select(F.min('_c18').alias('min'), F.max('_c18').alias('max')).show()
+data.select('_c18').describe().toPandas()
+data.select('_c18').approxQuantile("_c18",[0.1, 0.25, 0.5, 0.75, 0.9], 0.01)
+data.createOrReplaceTempView('NY_taxi')
+req = """select * from NY_taxi where _c18>0 and _c18<100"""
+data = spark.sql(req)
+data.count()
+data.select([F.count(F.when(F.isnan(c),c)).alias(c) for c in data.columns]).show()
+hist = data.select('_c18').rdd.flatMap(lambda x: x).histogram(100)
+plt.figure(figsize=(22,6))
+sns.barplot(list(map(lambda x: int(x), hist[0][:-1])), hist[1])
+plt.show()
+p = 0.017453292519943295
+data = data.withColumn('distance', 0.6213712*12742*F.asin((0.5-F.cos((data['_c10']-data['_c6'])*p)/2 +  F.cos(data['_c6']*p) * F.cos(data['_c10']*p) * (1-F.cos((data['_c9']-data['_c5'])*p))/2)**0.5))
+data.filter(data['distance']>0).count()
+data = data.filter(data['distance']>0)
+data = data.filter(data['distance']<150)
+data = data.withColumn('d_lon', data['_c5'] - data['_c9'] )
+data = data.withColumn('d_lat', data['_c6'] - data['_c10'])
+data = data.withColumn('lon_lat', (data['d_lon']**2 + data['d_lat']**2)**0.5)
+data = data.withColumn('dev_ll', data['d_lat']/data['lon_lat'])
+g =  180/np.pi
+data = data.withColumn('direction', F.when(data['d_lon']>0, g*F.asin(data['dev_ll'])).when((data['d_lon']<0) & (data['d_lat']>0), 180-g*F.asin(data['dev_ll'])).when((data['d_lon']<0) & (data['d_lat']<0), -180 - g*F.asin(data['dev_ll'])).otherwise(0))
+data = data.filter(data['_c3']>0)
+data = data.withColumn('dayofweek', F.dayofweek(data['_c1']))
+data = data.withColumn('hour', F.hour(data['_c1']))
+data = data.withColumn('peak_hours', F.when((data['hour']>=16) & (data['hour']<20) & (data['dayofweek']!=7)&(data['dayofweek']!=0), 1).otherwise(0))
+data = data.withColumn('night_time', F.when((data['hour']>=20) | (data['hour']<6), 1).otherwise(0))
+(trainingData, testData) = data.randomSplit([0.7, 0.3], seed=66)
+continuous_variables = ['dayofweek','hour','peak_hours','night_time','_c3','distance','direction']
+assembler = VectorAssembler(inputCols=continuous_variables,outputCol='features')
+
+
+trainingData = assembler.setHandleInvalid("skip").transform(trainingData)
+testData = assembler.setHandleInvalid("skip").transform(testData)
+trainingData.limit(3).toPandas()['features'][0]
+dt = DecisionTreeRegressor(featuresCol='features', labelCol='_c18')
+
+model = dt.fit(trainingData)
+predictions = model.transform(testData)
+print(model)
+evaluator = RegressionEvaluator(labelCol='_c18',  predictionCol="prediction", metricName="rmse")
+rmse_train = evaluator.evaluate(model.transform(trainingData))
+print("Train Root Mean Squared Error (RMSE) on test data = %g" % rmse_train)
+model.featureImportances
+testData.select(F.mean(testData['_c18'])).show()
+avr = testData.agg(F.mean(testData['_c18']).alias("mean")).collect()[0]["mean"]
+testData_upd = testData.withColumn('subt',((testData['_c18'] - avr)**2)**0.5)
+testData_upd.agg(F.mean(testData_upd['subt'])).show()
+gbt = GBTRegressor(featuresCol='features', labelCol='_c18')
+m = gbt.fit(trainingData)
+predictions = m.transform(testData)
+evaluator = RegressionEvaluator(labelCol='_c18',  predictionCol="prediction", metricName="rmse")
+rmse = evaluator.evaluate(predictions)
+print("GBT model. Root Mean Squared Error (RMSE) on test data = %g" % rmse)
+m.featureImportances
+BB_zoom = (-74.3, -73.7, 40.5, 40.9)
+nyc_map_zoom = plt.imread('/home/sai/Desktop/NYC_map_main.jpeg')
+fig, axs = plt.subplots(1, 2, figsize=(16,10))
+df = data.select('_c5', '_c6', '_c9', '_c10').limit(10000).toPandas()
+axs[0].scatter(df._c5, df._c6, zorder=1, alpha=0.3, c='r', s=1)
+axs[0].set_xlim((BB_zoom[0], BB_zoom[1]))
+axs[0].set_ylim((BB_zoom[2], BB_zoom[3]))
+axs[0].set_title('Pickup locations')
+axs[0].imshow(nyc_map_zoom, zorder=0, extent=BB_zoom)
+axs[1].scatter(df._c9, df._c10, zorder=1, alpha=0.3, c='r', s=1)
+axs[1].set_xlim((BB_zoom[0], BB_zoom[1]))
+axs[1].set_ylim((BB_zoom[2], BB_zoom[3]))
+axs[1].set_title('Dropoff locations')
+axs[1].imshow(nyc_map_zoom, zorder=0, extent=BB_zoom)
+fig.show()
